@@ -12,7 +12,7 @@ install: all
 	ln -sf $(CURDIR)/nightshift $(BIN)/nightshift
 	ln -sf $(CURDIR)/ddc $(BIN)/ddc
 	sed "s|@BIN@|$(CURDIR)/screenfilter|; s|@HOME@|$(HOME)|g" launchd/com.jaredgantt.screen-filter.plist > $(PLIST)
-	-launchctl bootout $(DOMAIN)/com.jaredgantt.screen-filter
-	launchctl bootstrap $(DOMAIN) $(PLIST)
+	# Restart in place when loaded: bootout returns before the job is gone, so a following bootstrap fails.
+	launchctl kickstart -k $(DOMAIN)/com.jaredgantt.screen-filter 2>/dev/null || launchctl bootstrap $(DOMAIN) $(PLIST)
 
 .PHONY: all install
