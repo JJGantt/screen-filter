@@ -1,14 +1,16 @@
-// Warm/dim filter for external displays, applied through the GPU gamma tables.
+// Warm/dim filter for every display (built-in and external), applied through the GPU gamma tables.
 //
 //   screenfilter daemon                  run the filter (launchd keeps this alive)
 //   screenfilter status                  settings and whether the filter is on now
 //   screenfilter auto | on | off         warm from sunset to sunrise / always / never
 //   screenfilter warmth <0-100>          0 = no tint, 100 = deep amber (1900K)
 //   screenfilter brightness <10-100>     scales the external display's output, day and night
+//   screenfilter laptop-brightness <10-100>  the same for the built-in screen
 //
 // A gamma table only lasts as long as the process that set it, and macOS resets it on sleep/wake
 // and display changes, so the daemon stays running and reapplies on each of those events.
 import AppKit
+import CoreLocation
 import Foundation
 
 // MARK: settings
@@ -19,7 +21,9 @@ struct Settings: Codable {
     var mode = "auto"
     var warmth = 50
     var brightness = 100
-    // Where sunset and sunrise are computed for (Jacksonville Beach).
+    var laptopBrightness = 100
+    // Where sunset and sunrise are computed for: the Mac's last location fix (Jacksonville Beach until
+    // the first one arrives).
     var latitude = 30.29
     var longitude = -81.39
 
@@ -30,6 +34,7 @@ struct Settings: Codable {
         mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? mode
         warmth = try c.decodeIfPresent(Int.self, forKey: .warmth) ?? warmth
         brightness = try c.decodeIfPresent(Int.self, forKey: .brightness) ?? brightness
+        laptopBrightness = try c.decodeIfPresent(Int.self, forKey: .laptopBrightness) ?? laptopBrightness
         latitude = try c.decodeIfPresent(Double.self, forKey: .latitude) ?? latitude
         longitude = try c.decodeIfPresent(Double.self, forKey: .longitude) ?? longitude
     }
@@ -119,35 +124,35 @@ func rgb(kelvin: Double) -> (Double, Double, Double) {
     return (min(c.0 / w.0, 1), min(c.1 / w.1, 1), min(c.2 / w.2, 1))
 }
 
-func externalDisplays() -> [CGDirectDisplayID] {
+func displays() -> [CGDirectDisplayID] {
     var ids = [CGDirectDisplayID](repeating: 0, count: 16); var n: UInt32 = 0
     CGGetOnlineDisplayList(16, &ids, &n)
-    return ids.prefix(Int(n)).filter { CGDisplayIsBuiltin($0) == 0 && CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
+    return ids.prefix(Int(n)).filter { CGDisplayMirrorsDisplay($0) == kCGNullDirectDisplay }
 }
 
-/// What each external display's table should be right now: (r, g, b) channel scale.
-func target(_ s: Settings) -> (Double, Double, Double) {
+/// What a display's table should be right now: (r, g, b) channel scale.
+func target(_ s: Settings, _ d: CGDirectDisplayID) -> (Double, Double, Double) {
     let warm = s.mode == "on" || (s.mode == "auto" && isNight(s))
     let k = warm ? 6500 - Double(min(max(s.warmth, 0), 100)) / 100 * (6500 - 1900) : 6500
     let (r, g, b) = rgb(kelvin: k)
-    let bright = Double(min(max(s.brightness, 10), 100)) / 100
+    let bright = Double(min(max(CGDisplayIsBuiltin(d) != 0 ? s.laptopBrightness : s.brightness, 10), 100)) / 100
     return (r * bright, g * bright, b * bright)
 }
 
 let tableSize = 256
 
 func apply(_ s: Settings, reason: String) {
-    let (r, g, b) = target(s)
-    for d in externalDisplays() {
+    for d in displays() {
+        let (r, g, b) = target(s, d)
         let ramp = (0..<tableSize).map { CGGammaValue(Double($0) / Double(tableSize - 1)) }
         let err = CGSetDisplayTransferByTable(d, UInt32(tableSize), ramp.map { $0 * CGGammaValue(r) },
                                               ramp.map { $0 * CGGammaValue(g) }, ramp.map { $0 * CGGammaValue(b) })
         if err != .success { logError("gamma set failed on display \(d): \(err.rawValue)") }
+        log(String(format: "applied (%@): display %u r %.2f g %.2f b %.2f", reason, d, r, g, b))
     }
-    log(String(format: "applied (%@): r %.2f g %.2f b %.2f on %d display(s)", reason, r, g, b, externalDisplays().count))
 }
 
-/// Top-of-ramp value each external display is showing, or nil when it cannot be read.
+/// Top-of-ramp value a display is showing, or nil when it cannot be read.
 func current(_ d: CGDirectDisplayID) -> (Double, Double, Double)? {
     let cap = Int(CGDisplayGammaTableCapacity(d))
     var r = [CGGammaValue](repeating: 0, count: cap), g = r, b = r; var n: UInt32 = 0
@@ -157,11 +162,37 @@ func current(_ d: CGDirectDisplayID) -> (Double, Double, Double)? {
 }
 
 func matches(_ s: Settings) -> Bool {
-    let t = target(s)
-    return externalDisplays().allSatisfy { d in
+    return displays().allSatisfy { d in
+        let t = target(s, d)
         guard let c = current(d) else { return false }
         return abs(c.0 - t.0) < 0.01 && abs(c.1 - t.1) < 0.01 && abs(c.2 - t.2) < 0.01
     }
+}
+
+// MARK: location
+
+/// Keeps the configured coordinates at the Mac's location: one fix at start, then a new one whenever
+/// it has moved significantly. Needs Location Services permission for ScreenFilter.app, asked once.
+final class Locator: NSObject, CLLocationManagerDelegate {
+    let manager = CLLocationManager()
+    let onFix: (CLLocation) -> Void
+    init(onFix: @escaping (CLLocation) -> Void) {
+        self.onFix = onFix
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyKilometer
+    }
+    func locationManagerDidChangeAuthorization(_ m: CLLocationManager) {
+        switch m.authorizationStatus {
+        case .notDetermined: m.requestWhenInUseAuthorization()
+        case .authorized, .authorizedAlways:
+            m.startMonitoringSignificantLocationChanges()
+            m.requestLocation()
+        default: logError("location permission not granted (status \(m.authorizationStatus.rawValue)); using saved coordinates")
+        }
+    }
+    func locationManager(_ m: CLLocationManager, didUpdateLocations l: [CLLocation]) { if let f = l.last { onFix(f) } }
+    func locationManager(_ m: CLLocationManager, didFailWithError e: Error) { logError("location fix failed: \(e)") }
 }
 
 // MARK: daemon
@@ -201,8 +232,20 @@ func runDaemon() -> Never {
     watcher.setEventHandler {
         settings = loadSettings()
         apply(settings, reason: "settings")
+        armSunTimer()
     }
     watcher.resume()
+
+    // A new location moves sunset and sunrise; saving it reaches the watcher above, which re-arms.
+    let locator = Locator { fix in
+        var s = loadSettings()
+        let lat = (fix.coordinate.latitude * 100).rounded() / 100, lon = (fix.coordinate.longitude * 100).rounded() / 100
+        guard lat != s.latitude || lon != s.longitude else { return }
+        log("location \(lat),\(lon)")
+        s.latitude = lat; s.longitude = lon
+        saveSettings(s)
+    }
+    _ = locator
 
     // Backstop behind the events above: something they did not announce reset the table.
     let backstop = DispatchSource.makeTimerSource(queue: .main)
@@ -235,9 +278,11 @@ func printStatus() {
     let next = nextSunChange(s).map { " next change \(f.string(from: $0))" } ?? ""
     print("mode:       \(s.mode)   (\(isNight(s) ? "night" : "day") now;\(next))")
     print("warmth:     \(s.warmth)")
-    print("brightness: \(s.brightness)")
-    for d in externalDisplays() {
-        if let c = current(d) { print(String(format: "display %u:  r %.2f g %.2f b %.2f", d, c.0, c.1, c.2)) }
+    print("brightness: \(s.brightness)   laptop: \(s.laptopBrightness)")
+    print("location:   \(s.latitude),\(s.longitude)")
+    for d in displays() {
+        let name = CGDisplayIsBuiltin(d) != 0 ? "laptop" : "external \(d)"
+        if let c = current(d) { print(String(format: "%@:  r %.2f g %.2f b %.2f", name, c.0, c.1, c.2)) }
     }
     if !running { print("filter is NOT applied (daemon not running?)") }
 }
@@ -256,8 +301,9 @@ case "status": printStatus(); exit(0)
 case "auto", "on", "off": s.mode = args[0]
 case "warmth": s.warmth = intArg(0...100)
 case "brightness": s.brightness = intArg(10...100)
+case "laptop-brightness": s.laptopBrightness = intArg(10...100)
 default:
-    print("usage: screenfilter status | auto | on | off | warmth <0-100> | brightness <10-100>"); exit(2)
+    print("usage: screenfilter status | auto | on | off | warmth <0-100> | brightness <10-100> | laptop-brightness <10-100>"); exit(2)
 }
 saveSettings(s)
 // The daemon applies the change; report what the display shows once it has.
