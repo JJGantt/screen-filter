@@ -16,6 +16,9 @@ A warm, dimmable filter for the Mac's external display, plus small CLIs for Nigh
     screenfilter warmth 0-100    # 0 = no tint, 100 = 1900K
     screenfilter brightness 10-100   # scales the display's output, day and night
 
+The menu bar control is `screenfilter.lua` in the hammerspoon-config repo (`◐` on, `○` off): mode,
+warmth and brightness presets, each running this CLI.
+
 Settings live in `~/.config/screen-filter/config.json`; the CLI writes it and the daemon picks the
 change up from a directory watch. Only external displays are touched; the built-in screen is left to
 Night Shift and its own backlight.
