@@ -11,7 +11,7 @@ A warm, dimmable filter for the Mac's external display, plus small CLIs for Nigh
 ## screenfilter
 
     screenfilter status
-    screenfilter auto            # warm while Night Shift is active (its sunset-to-sunrise schedule)
+    screenfilter auto            # warm from sunset to sunrise
     screenfilter on | off        # warm always / never
     screenfilter warmth 0-100    # 0 = no tint, 100 = 1900K
     screenfilter brightness 10-100   # scales the display's output, day and night
@@ -29,7 +29,9 @@ How it stays applied:
   (`com.jaredgantt.screen-filter`, KeepAlive) and restores the default tables when stopped.
 - macOS resets the tables on display reconfiguration and wake; the daemon reapplies on
   `CGDisplayRegisterReconfigurationCallback` and the NSWorkspace wake notifications.
-- In `auto`, it follows Night Shift's own status callback, so the schedule is the system's.
+- In `auto`, it computes sunset and sunrise itself (NOAA approximation) for `latitude`/`longitude` in the
+  config (defaults: Jacksonville Beach) and sleeps on a wall-clock timer to exactly the next one. It does
+  not use Night Shift or Location Services.
 - A 5-minute backstop compares the live table with the target and logs an ERROR when it had to
   reapply, meaning some reset arrived without an event.
 - Anything that calls `CGDisplayRestoreColorSyncSettings` (another gamma tool, a test script) clears

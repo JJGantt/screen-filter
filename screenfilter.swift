@@ -2,7 +2,7 @@
 //
 //   screenfilter daemon                  run the filter (launchd keeps this alive)
 //   screenfilter status                  settings and whether the filter is on now
-//   screenfilter auto | on | off         warm when Night Shift is active / always / never
+//   screenfilter auto | on | off         warm from sunset to sunrise / always / never
 //   screenfilter warmth <0-100>          0 = no tint, 100 = deep amber (1900K)
 //   screenfilter brightness <10-100>     scales the external display's output, day and night
 //
@@ -19,6 +19,20 @@ struct Settings: Codable {
     var mode = "auto"
     var warmth = 50
     var brightness = 100
+    // Where sunset and sunrise are computed for (Jacksonville Beach).
+    var latitude = 30.29
+    var longitude = -81.39
+
+    init() {}
+    // A key missing from the file keeps its default, so adding a setting never invalidates the file.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mode = try c.decodeIfPresent(String.self, forKey: .mode) ?? mode
+        warmth = try c.decodeIfPresent(Int.self, forKey: .warmth) ?? warmth
+        brightness = try c.decodeIfPresent(Int.self, forKey: .brightness) ?? brightness
+        latitude = try c.decodeIfPresent(Double.self, forKey: .latitude) ?? latitude
+        longitude = try c.decodeIfPresent(Double.self, forKey: .longitude) ?? longitude
+    }
 }
 
 func loadSettings() -> Settings {
@@ -38,30 +52,56 @@ func saveSettings(_ s: Settings) {
 func log(_ m: String) { print("\(Date()) \(m)"); fflush(stdout) }
 func logError(_ m: String) { FileHandle.standardError.write("\(Date()) ERROR \(m)\n".data(using: .utf8)!) }
 
-// MARK: Night Shift state (private CoreBrightness CBBlueLightClient)
+// MARK: sun schedule
 
-@objc protocol BlueLight {
-    func getBlueLightStatus(_ s: UnsafeMutableRawPointer) -> Bool
-    func setStatusNotificationBlock(_ b: @escaping @convention(block) (UnsafeMutableRawPointer?) -> Void)
+/// Sunrise and sunset (NOAA approximation, official zenith) on the local calendar day containing `day`.
+func sunTimes(on day: Date, lat: Double, lon: Double) -> (rise: Date, set: Date)? {
+    let cal = Calendar.current
+    let n = Double(cal.ordinality(of: .day, in: .year, for: day)!)
+    let c = cal.dateComponents([.year, .month, .day], from: day)
+    var utc = Calendar(identifier: .gregorian); utc.timeZone = TimeZone(identifier: "UTC")!
+    let midnightUTC = utc.date(from: DateComponents(year: c.year, month: c.month, day: c.day))!
+    let rad = Double.pi / 180, lngHour = lon / 15
+    func event(rising: Bool) -> Date? {
+        let t = n + ((rising ? 6 : 18) - lngHour) / 24
+        let m = 0.9856 * t - 3.289
+        var l = m + 1.916 * sin(m * rad) + 0.020 * sin(2 * m * rad) + 282.634
+        l = l.truncatingRemainder(dividingBy: 360); if l < 0 { l += 360 }
+        var ra = atan(0.91764 * tan(l * rad)) / rad
+        ra = ra.truncatingRemainder(dividingBy: 360); if ra < 0 { ra += 360 }
+        ra = (ra + floor(l / 90) * 90 - floor(ra / 90) * 90) / 15
+        let sinDec = 0.39782 * sin(l * rad), cosDec = cos(asin(sinDec))
+        let cosH = (cos(90.833 * rad) - sinDec * sin(lat * rad)) / (cosDec * cos(lat * rad))
+        guard abs(cosH) <= 1 else { return nil }  // no sunrise/sunset that day (polar)
+        let h = (rising ? 360 - acos(cosH) / rad : acos(cosH) / rad) / 15
+        var ut = (h + ra - 0.06571 * t - 6.622 - lngHour).truncatingRemainder(dividingBy: 24)
+        if ut < 0 { ut += 24 }
+        // UT is the hour on the UTC day; an evening event west of Greenwich can land after UTC midnight.
+        var date = midnightUTC.addingTimeInterval(ut * 3600)
+        if cal.startOfDay(for: date) < cal.startOfDay(for: day) { date += 86400 }
+        if cal.startOfDay(for: date) > cal.startOfDay(for: day) { date -= 86400 }
+        return date
+    }
+    guard let r = event(rising: true), let s = event(rising: false) else { return nil }
+    return (r, s)
 }
 
-struct BlueLightStatus {
-    var supported = false, on = false, sunOK = false  // `on`: the tint is showing now; the first byte stays set
-    var mode: Int32 = 0, fh: Int32 = 0, fm: Int32 = 0, th: Int32 = 0, tm: Int32 = 0
-    var flags: UInt64 = 0, available = false, extra = false
+func isNight(_ s: Settings, at now: Date = Date()) -> Bool {
+    guard let t = sunTimes(on: now, lat: s.latitude, lon: s.longitude) else {
+        logError("no sunrise/sunset computable for \(s.latitude),\(s.longitude); treating as day"); return false
+    }
+    return now < t.rise || now >= t.set
 }
 
-let blueLight: BlueLight? = {
-    guard dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBrightness", RTLD_NOW) != nil,
-          let cls = NSClassFromString("CBBlueLightClient") as? NSObject.Type else { return nil }
-    return unsafeBitCast(cls.init(), to: BlueLight.self)
-}()
-
-func nightShiftActive() -> Bool {
-    guard let bl = blueLight else { logError("CoreBrightness unavailable; treating Night Shift as off"); return false }
-    var s = BlueLightStatus()
-    _ = withUnsafeMutablePointer(to: &s) { bl.getBlueLightStatus(UnsafeMutableRawPointer($0)) }
-    return s.on
+/// The next sunrise or sunset after `now`.
+func nextSunChange(_ s: Settings, after now: Date = Date()) -> Date? {
+    for offset in 0...2 {
+        let day = Calendar.current.date(byAdding: .day, value: offset, to: now)!
+        guard let t = sunTimes(on: day, lat: s.latitude, lon: s.longitude) else { return nil }
+        if t.rise > now { return t.rise }
+        if t.set > now { return t.set }
+    }
+    return nil
 }
 
 // MARK: gamma
@@ -87,7 +127,7 @@ func externalDisplays() -> [CGDirectDisplayID] {
 
 /// What each external display's table should be right now: (r, g, b) channel scale.
 func target(_ s: Settings) -> (Double, Double, Double) {
-    let warm = s.mode == "on" || (s.mode == "auto" && nightShiftActive())
+    let warm = s.mode == "on" || (s.mode == "auto" && isNight(s))
     let k = warm ? 6500 - Double(min(max(s.warmth, 0), 100)) / 100 * (6500 - 1900) : 6500
     let (r, g, b) = rgb(kelvin: k)
     let bright = Double(min(max(s.brightness, 10), 100)) / 100
@@ -142,8 +182,17 @@ func runDaemon() -> Never {
         ws.addObserver(forName: name, object: nil, queue: .main) { _ in reapply(name.rawValue) }
     }
 
-    // Night Shift turning on or off at sunset/sunrise is what moves the filter in auto mode.
-    blueLight?.setStatusNotificationBlock { _ in reapply("night shift") }
+    // Sunset and sunrise: sleep to exactly the next one. Wall-clock time, so it still fires on time
+    // after the Mac has slept; every apply re-arms it for the change after that.
+    let sunTimer = DispatchSource.makeTimerSource(queue: .main)
+    func armSunTimer() {
+        guard let next = nextSunChange(settings) else { return }
+        sunTimer.schedule(wallDeadline: DispatchWallTime(timespec: timespec(tv_sec: Int(next.timeIntervalSince1970), tv_nsec: 0)) + 1)
+        log("next sun change \(next)")
+    }
+    sunTimer.setEventHandler { apply(settings, reason: "sun"); armSunTimer() }
+    sunTimer.resume()
+    armSunTimer()
 
     // Settings changes from the CLI. Watch the directory: the CLI replaces the file atomically.
     try? FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -182,7 +231,9 @@ func runDaemon() -> Never {
 func printStatus() {
     let s = loadSettings()
     let running = matches(s)
-    print("mode:       \(s.mode)   (night shift active now: \(nightShiftActive() ? "yes" : "no"))")
+    let f = DateFormatter(); f.dateStyle = .none; f.timeStyle = .short
+    let next = nextSunChange(s).map { " next change \(f.string(from: $0))" } ?? ""
+    print("mode:       \(s.mode)   (\(isNight(s) ? "night" : "day") now;\(next))")
     print("warmth:     \(s.warmth)")
     print("brightness: \(s.brightness)")
     for d in externalDisplays() {
