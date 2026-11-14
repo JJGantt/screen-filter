@@ -17,9 +17,9 @@ guard dlopen("/System/Library/PrivateFrameworks/CoreBrightness.framework/CoreBri
 }
 let client = unsafeBitCast(cls.init(), to: BlueLight.self)
 
-// Status struct: active, enabled, sunSchedulePermitted (BOOLs), mode (int),
+// Status struct: supported, on (whether the tint is showing now), sunSchedulePermitted (BOOLs), mode (int),
 // schedule {from{hour,minute}, to{hour,minute}} (ints), disableFlags (uint64)
-struct Status { var active: Bool = false; var enabled: Bool = false; var sunOK: Bool = false
+struct Status { var supported: Bool = false; var on: Bool = false; var sunOK: Bool = false
     var mode: Int32 = 0; var fh: Int32 = 0; var fm: Int32 = 0; var th: Int32 = 0; var tm: Int32 = 0
     var flags: UInt64 = 0; var a: Bool = false; var b: Bool = false }
 
@@ -29,7 +29,7 @@ func status() {
     _ = client.getStrength(&strength)
     let modes = ["manual only", "sunset to sunrise", "custom schedule"]
     let mode = s.mode >= 0 && s.mode < 3 ? modes[Int(s.mode)] : "mode \(s.mode)"
-    print("on now:   \(s.active ? "yes" : "no")")
+    print("on now:   \(s.on ? "yes" : "no")")
     print("warmth:   \(Int((strength * 100).rounded()))")
     print("schedule: \(mode)" + (s.mode == 2 ? String(format: " %02d:%02d-%02d:%02d", s.fh, s.fm, s.th, s.tm) : ""))
     if s.mode == 1 && !s.sunOK { print("note: sunset schedule needs Location Services for System Services") }

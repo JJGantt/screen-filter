@@ -46,7 +46,7 @@ func logError(_ m: String) { FileHandle.standardError.write("\(Date()) ERROR \(m
 }
 
 struct BlueLightStatus {
-    var active = false, enabled = false, sunOK = false
+    var supported = false, on = false, sunOK = false  // `on`: the tint is showing now; the first byte stays set
     var mode: Int32 = 0, fh: Int32 = 0, fm: Int32 = 0, th: Int32 = 0, tm: Int32 = 0
     var flags: UInt64 = 0, available = false, extra = false
 }
@@ -61,7 +61,7 @@ func nightShiftActive() -> Bool {
     guard let bl = blueLight else { logError("CoreBrightness unavailable; treating Night Shift as off"); return false }
     var s = BlueLightStatus()
     _ = withUnsafeMutablePointer(to: &s) { bl.getBlueLightStatus(UnsafeMutableRawPointer($0)) }
-    return s.active
+    return s.on
 }
 
 // MARK: gamma
