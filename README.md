@@ -17,8 +17,11 @@ It replaces Night Shift, which is turned off on this Mac so the two tints do not
     screenfilter brightness 10-100     # external display output, day and night
     screenfilter laptop-brightness 10-100   # built-in screen output, on top of its backlight
 
-The menu bar control is `screenfilter.lua` in the hammerspoon-config repo (`◐` on, `○` off): mode,
-plus warmth and per-screen brightness submenus, each running this CLI.
+The daemon also owns the menu bar icon (`◐` on, `○` off): mode, warmth and per-screen brightness
+submenus, and Quit. The menu is rebuilt from the config each time it opens and a choice saves the
+config, so the menu, the CLI and a hand edit of the file all go through the same path. Quit restores
+the screens; launchd restarts the daemon after a crash but not after a clean quit, so it comes back
+at the next login (or `launchctl kickstart gui/$(id -u)/com.jaredgantt.screen-filter`).
 
 Settings live in `~/.config/screen-filter/config.json`; the CLI writes it and the daemon picks the
 change up from a directory watch. A key missing from the file keeps its default.
@@ -26,7 +29,7 @@ change up from a directory watch. A key missing from the file keeps its default.
 How it stays applied:
 
 - A gamma table lasts only as long as the process that set it, so the daemon runs under launchd
-  (`com.jaredgantt.screen-filter`, KeepAlive) and restores the default tables when stopped.
+  (`com.jaredgantt.screen-filter`, restarted on a crash) and restores the default tables when stopped.
 - macOS resets the tables on display reconfiguration and wake; the daemon reapplies on
   `CGDisplayRegisterReconfigurationCallback` and the NSWorkspace wake notifications.
 - In `auto`, it computes sunset and sunrise itself (NOAA approximation) for `latitude`/`longitude` in the

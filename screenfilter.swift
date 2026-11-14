@@ -195,10 +195,72 @@ final class Locator: NSObject, CLLocationManagerDelegate {
     func locationManager(_ m: CLLocationManager, didFailWithError e: Error) { logError("location fix failed: \(e)") }
 }
 
+// MARK: menu bar
+
+/// The menu bar icon: mode, warmth and per-screen brightness. Rebuilt from the settings file each
+/// time it opens; a choice saves the file, which the daemon's watcher applies like any other change.
+final class StatusMenu: NSObject, NSMenuDelegate {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let menu = NSMenu()
+    static let warmths = [0, 25, 50, 65, 80, 100]
+    static let brightnesses = [100, 85, 70, 55, 40, 30, 20, 10]
+
+    override init() {
+        super.init()
+        menu.delegate = self
+        item.menu = menu
+        refreshIcon(loadSettings())
+    }
+
+    func refreshIcon(_ s: Settings) { item.button?.title = s.mode == "off" ? "○" : "◐" }
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        let s = loadSettings()
+        menu.removeAllItems()
+        for (title, mode) in [("Auto (sunset to sunrise)", "auto"), ("Always on", "on"), ("Off", "off")] {
+            menu.addItem(choice(title, s.mode == mode) { $0.mode = mode })
+        }
+        menu.addItem(.separator())
+        menu.addItem(submenu("Warmth", Self.warmths, s.warmth, "") { s, v in s.warmth = v })
+        menu.addItem(submenu("Monitor brightness", Self.brightnesses, s.brightness, "%") { s, v in s.brightness = v })
+        menu.addItem(submenu("Laptop brightness", Self.brightnesses, s.laptopBrightness, "%") { s, v in s.laptopBrightness = v })
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: ""))
+    }
+
+    private func submenu(_ title: String, _ values: [Int], _ current: Int, _ suffix: String,
+                         _ set: @escaping (inout Settings, Int) -> Void) -> NSMenuItem {
+        let parent = NSMenuItem(title: "\(title): \(current)\(suffix)", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for v in values { sub.addItem(choice("\(v)\(suffix)", v == current) { set(&$0, v) }) }
+        parent.submenu = sub
+        return parent
+    }
+
+    private func choice(_ title: String, _ on: Bool, _ change: @escaping (inout Settings) -> Void) -> NSMenuItem {
+        let mi = ClosureItem(title: title) { var s = loadSettings(); change(&s); saveSettings(s) }
+        mi.state = on ? .on : .off
+        return mi
+    }
+}
+
+final class ClosureItem: NSMenuItem {
+    let run: () -> Void
+    init(title: String, run: @escaping () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(fire), keyEquivalent: "")
+        target = self
+    }
+    required init(coder: NSCoder) { fatalError("unused") }
+    @objc func fire() { run() }
+}
+
 // MARK: daemon
 
 func runDaemon() -> Never {
     var settings = loadSettings()
+    _ = NSApplication.shared
+    let statusMenu = StatusMenu()
     let reapply: (String) -> Void = { reason in DispatchQueue.main.async { apply(settings, reason: reason) } }
 
     // Display added, removed or reconfigured: macOS restores the default table, so set ours again.
@@ -233,6 +295,7 @@ func runDaemon() -> Never {
         settings = loadSettings()
         apply(settings, reason: "settings")
         armSunTimer()
+        statusMenu.refreshIcon(settings)
     }
     watcher.resume()
 
@@ -261,10 +324,15 @@ func runDaemon() -> Never {
     signal(SIGTERM, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
     term.setEventHandler { log("stopping"); CGDisplayRestoreColorSyncSettings(); exit(0) }
+    // Quit from the menu: restore the screens on the way out. launchd starts it again only at login,
+    // because KeepAlive is set to restart on a crash, not on a clean exit.
+    NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+        log("quit from menu"); CGDisplayRestoreColorSyncSettings()
+    }
     term.resume()
 
     apply(settings, reason: "start")
-    NSApplication.shared.setActivationPolicy(.prohibited)
+    NSApplication.shared.setActivationPolicy(.accessory)
     NSApplication.shared.run()
     exit(0)
 }
