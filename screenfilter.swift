@@ -98,6 +98,8 @@ func isNight(_ s: Settings, at now: Date = Date()) -> Bool {
     return now < t.rise || now >= t.set
 }
 
+func warmNow(_ s: Settings) -> Bool { s.mode == "on" || (s.mode == "auto" && isNight(s)) }
+
 /// The next sunrise or sunset after `now`.
 func nextSunChange(_ s: Settings, after now: Date = Date()) -> Date? {
     for offset in 0...2 {
@@ -132,8 +134,7 @@ func displays() -> [CGDirectDisplayID] {
 
 /// What a display's table should be right now: (r, g, b) channel scale.
 func target(_ s: Settings, _ d: CGDirectDisplayID) -> (Double, Double, Double) {
-    let warm = s.mode == "on" || (s.mode == "auto" && isNight(s))
-    let k = warm ? 6500 - Double(min(max(s.warmth, 0), 100)) / 100 * (6500 - 1900) : 6500
+    let k = warmNow(s) ? 6500 - Double(min(max(s.warmth, 0), 100)) / 100 * (6500 - 1900) : 6500
     let (r, g, b) = rgb(kelvin: k)
     let bright = Double(min(max(CGDisplayIsBuiltin(d) != 0 ? s.laptopBrightness : s.brightness, 10), 100)) / 100
     return (r * bright, g * bright, b * bright)
@@ -212,12 +213,17 @@ final class StatusMenu: NSObject, NSMenuDelegate {
         refreshIcon(loadSettings())
     }
 
-    func refreshIcon(_ s: Settings) { item.button?.title = s.mode == "off" ? "○" : "◐" }
+    func refreshIcon(_ s: Settings) { item.button?.title = warmNow(s) ? "◐" : "○" }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         let s = loadSettings()
         menu.removeAllItems()
-        for (title, mode) in [("Auto (sunset to sunrise)", "auto"), ("Always on", "on"), ("Off", "off")] {
+        var auto = "Auto (sunset to sunrise)"
+        if let next = nextSunChange(s) {
+            let at = next.formatted(date: .omitted, time: .shortened)
+            auto = isNight(s) ? "Auto: warm until \(at)" : "Auto: warm from \(at)"
+        }
+        for (title, mode) in [(auto, "auto"), ("Always on", "on"), ("Off", "off")] {
             menu.addItem(choice(title, s.mode == mode) { $0.mode = mode })
         }
         menu.addItem(.separator())
@@ -283,7 +289,7 @@ func runDaemon() -> Never {
         sunTimer.schedule(wallDeadline: DispatchWallTime(timespec: timespec(tv_sec: Int(next.timeIntervalSince1970), tv_nsec: 0)) + 1)
         log("next sun change \(next)")
     }
-    sunTimer.setEventHandler { apply(settings, reason: "sun"); armSunTimer() }
+    sunTimer.setEventHandler { apply(settings, reason: "sun"); statusMenu.refreshIcon(settings); armSunTimer() }
     sunTimer.resume()
     armSunTimer()
 

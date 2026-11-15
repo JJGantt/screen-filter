@@ -17,7 +17,8 @@ It replaces Night Shift, which is turned off on this Mac so the two tints do not
     screenfilter brightness 10-100     # external display output, day and night
     screenfilter laptop-brightness 10-100   # built-in screen output, on top of its backlight
 
-The daemon also owns the menu bar icon (`◐` on, `○` off): mode, warmth and per-screen brightness
+The daemon also owns the menu bar icon (`◐` while the screens are tinted, `○` while not, so `○` in
+`auto` during the day). The Auto item shows the next switch time. The menu has mode, warmth and per-screen brightness
 submenus, and Quit. The menu is rebuilt from the config each time it opens and a choice saves the
 config, so the menu, the CLI and a hand edit of the file all go through the same path. Quit restores
 the screens; launchd restarts the daemon after a crash but not after a clean quit, so it comes back
