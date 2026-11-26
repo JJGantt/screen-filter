@@ -47,8 +47,13 @@ How it stays applied:
 Night Shift must stay off (System Settings → Displays → Night Shift, schedule Off), or it tints the
 built-in screen a second time.
 
-Log: `~/Library/Logs/screen-filter.log`. It is a Mac-only desktop utility (it drives this Mac's
-displays) and does not report to the ops responder; a failure shows on the screen itself.
+Log: `~/Library/Logs/screen-filter.log`. The daemon reports to the ops responder (health/responder) as
+`mac/screen-filter`: every ERROR line above is sent as an error, and each backstop pass is its heartbeat
+(`every_s` 300). A run that crashed is reported by the next one: the daemon keeps
+`$TMPDIR/screen-filter.running` while it runs and removes it on each clean stop. The reporter is the
+`Ops` enum in `screenfilter.swift` (the ops-report wire format; `OPS_URLS` and `OPS_TOKEN` from
+`~/.config/ops/env`). The CLI does not report. It is Mac-only: it drives this Mac's displays, so it has
+no fallback machine.
 
 ## ddc
 

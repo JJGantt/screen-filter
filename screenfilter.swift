@@ -51,11 +51,101 @@ func loadSettings() -> Settings {
 func saveSettings(_ s: Settings) {
     try? FileManager.default.createDirectory(at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
     let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-    do { try enc.encode(s).write(to: configURL, options: .atomic) } catch { logError("cannot write config: \(error)"); exit(1) }
+    do { try enc.encode(s).write(to: configURL, options: .atomic) } catch { logError("cannot write config: \(error)"); Ops.flush(); exit(1) }
 }
 
 func log(_ m: String) { print("\(Date()) \(m)"); fflush(stdout) }
-func logError(_ m: String) { FileHandle.standardError.write("\(Date()) ERROR \(m)\n".data(using: .utf8)!) }
+func logError(_ m: String) {
+    FileHandle.standardError.write("\(Date()) ERROR \(m)\n".data(using: .utf8)!)
+    Ops.error(m)
+}
+
+// MARK: ops responder
+
+/// Errors and heartbeats to the ops responder (health/responder), as mac/screen-filter: the same wire
+/// format as the ops-report Python package. Only the daemon reports (`Ops.enabled`); the CLI is run by
+/// hand and prints its own failures. OPS_URLS and OPS_TOKEN come from the environment or, failing that,
+/// ~/.config/ops/env. An error no URL accepted is spooled and sent after the next send that gets through;
+/// a missed beat is not kept.
+enum Ops {
+    static var enabled = false
+    static let service = "screen-filter"
+    static let env: [String: String] = {
+        var out: [String: String] = [:]
+        let path = NSHomeDirectory() + "/.config/ops/env"
+        for line in ((try? String(contentsOfFile: path, encoding: .utf8)) ?? "").split(separator: "\n") {
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard !t.hasPrefix("#"), let eq = t.firstIndex(of: "=") else { continue }
+            out[String(t[..<eq])] = String(t[t.index(after: eq)...])
+        }
+        return out.merging(ProcessInfo.processInfo.environment) { _, e in e }
+    }()
+    static let urls = (env["OPS_URLS"] ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    static let token = env["OPS_TOKEN"] ?? ""
+    static let spool = env["OPS_SPOOL"] ?? (NSTemporaryDirectory() + "ops-spool-screen-filter.jsonl")
+    static let queue = DispatchQueue(label: "ops-report")
+    static let pending = DispatchGroup()
+
+    static func start() {
+        enabled = true
+        if urls.isEmpty || token.isEmpty {
+            FileHandle.standardError.write("[ops] \(service): OPS_URLS or OPS_TOKEN is unset: not reporting\n".data(using: .utf8)!)
+        }
+        queue.async(group: pending) { flushSpool() }
+    }
+
+    static func error(_ message: String) {
+        guard enabled else { return }
+        let at = ISO8601DateFormatter().string(from: Date())
+        let item: [String: Any] = ["machine": "mac", "service": service, "message": String(message.prefix(4000)), "at": at]
+        queue.async(group: pending) {
+            if send("error", [item]) { flushSpool() } else { appendSpool(item) }
+        }
+    }
+
+    static func beat(_ everyS: Int) {
+        guard enabled else { return }
+        let item: [String: Any] = ["machine": "mac", "service": service, "every_s": everyS, "info": NSNull()]
+        queue.async(group: pending) { if send("beat", [item]) { flushSpool() } }
+    }
+
+    /// Waits for queued sends, for a path that is about to exit.
+    static func flush() { _ = pending.wait(timeout: .now() + 5) }
+
+    private static func send(_ kind: String, _ items: [[String: Any]]) -> Bool {
+        guard !token.isEmpty, let body = try? JSONSerialization.data(withJSONObject: items) else { return false }
+        for u in urls {
+            guard let url = URL(string: "\(u)/\(kind)") else { continue }
+            var req = URLRequest(url: url, timeoutInterval: 8)
+            req.httpMethod = "POST"
+            req.httpBody = body
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let done = DispatchSemaphore(value: 0)
+            var ok = false
+            URLSession.shared.dataTask(with: req) { _, resp, _ in
+                if let code = (resp as? HTTPURLResponse)?.statusCode, (200..<300).contains(code) { ok = true }
+                done.signal()
+            }.resume()
+            done.wait()
+            if ok { return true }
+        }
+        return false
+    }
+
+    private static func appendSpool(_ item: [String: Any]) {
+        guard var line = try? JSONSerialization.data(withJSONObject: item) else { return }
+        line.append(0x0A)
+        if let h = FileHandle(forWritingAtPath: spool) { h.seekToEndOfFile(); h.write(line); h.closeFile() }
+        else { FileManager.default.createFile(atPath: spool, contents: line) }
+    }
+
+    private static func flushSpool() {
+        guard let text = try? String(contentsOfFile: spool, encoding: .utf8) else { return }
+        let items = text.split(separator: "\n").compactMap { try? JSONSerialization.jsonObject(with: Data($0.utf8)) as? [String: Any] }
+        if items.isEmpty || send("error", items) { try? FileManager.default.removeItem(atPath: spool) }
+    }
+}
 
 // MARK: sun schedule
 
@@ -263,7 +353,21 @@ final class ClosureItem: NSMenuItem {
 
 // MARK: daemon
 
+// Present while a daemon runs and removed on each clean stop, so a run that crashed (launchd restarts
+// it) is reported by the run that follows it.
+let runningMarker = NSTemporaryDirectory() + "screen-filter.running"
+
 func runDaemon() -> Never {
+    Ops.start()
+    if let prev = try? String(contentsOfFile: runningMarker, encoding: .utf8) {
+        logError("previous daemon run (pid \(prev.trimmingCharacters(in: .whitespacesAndNewlines))) ended without a clean stop")
+    }
+    FileManager.default.createFile(atPath: runningMarker, contents: "\(getpid())\n".data(using: .utf8))
+    func cleanStop(_ why: String) {
+        log(why); CGDisplayRestoreColorSyncSettings()
+        try? FileManager.default.removeItem(atPath: runningMarker)
+        Ops.flush()
+    }
     var settings = loadSettings()
     _ = NSApplication.shared
     let statusMenu = StatusMenu()
@@ -316,10 +420,12 @@ func runDaemon() -> Never {
     }
     _ = locator
 
-    // Backstop behind the events above: something they did not announce reset the table.
+    // Backstop behind the events above: something they did not announce reset the table. Each pass is
+    // also the daemon's heartbeat, so a wedged main queue goes quiet.
     let backstop = DispatchSource.makeTimerSource(queue: .main)
-    backstop.schedule(deadline: .now() + 300, repeating: 300)
+    backstop.schedule(deadline: .now(), repeating: 300)
     backstop.setEventHandler {
+        Ops.beat(300)
         if !matches(settings) {
             logError("gamma table was reset without an event; reapplying")
             apply(settings, reason: "backstop")
@@ -329,11 +435,11 @@ func runDaemon() -> Never {
 
     signal(SIGTERM, SIG_IGN)
     let term = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
-    term.setEventHandler { log("stopping"); CGDisplayRestoreColorSyncSettings(); exit(0) }
+    term.setEventHandler { cleanStop("stopping"); exit(0) }
     // Quit from the menu: restore the screens on the way out. launchd starts it again only at login,
     // because KeepAlive is set to restart on a crash, not on a clean exit.
     NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
-        log("quit from menu"); CGDisplayRestoreColorSyncSettings()
+        cleanStop("quit from menu")
     }
     term.resume()
 
